@@ -1,2 +1,4 @@
 .moonraker.conf.bkp
 printer-*
+moonraker.conf.backup
+crowsnest.conf.*
