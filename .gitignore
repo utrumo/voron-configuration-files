@@ -2,3 +2,4 @@
 printer-*
 moonraker.conf.backup
 crowsnest.conf.*
+secrets.conf
