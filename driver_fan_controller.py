@@ -23,6 +23,7 @@
 import logging
 
 PIN_MIN_TIME = 0.100
+WARMUP_DURATION = 5.0
 
 class DriverFanController:
     def __init__(self, config):
@@ -52,6 +53,7 @@ class DriverFanController:
         self.integral = 0.0
         self.last_speed = -1.0
         self.last_time = 0.0
+        self._warmup_until = 0.0
 
     def handle_ready(self):
         self.gcode = self.printer.lookup_object('gcode')
@@ -96,6 +98,7 @@ class DriverFanController:
             # All sensors returned None (steppers disabled) — ramp down
             self.smooth_temp = 0.0
             self._ema_initialized = False
+            self._warmup_until = 0.0
             self.integral = 0.0
             speed = 0.0
             if self.last_speed > 0:
@@ -109,21 +112,38 @@ class DriverFanController:
 
         raw_temp = max(temps)
 
-        # EMA smoothing — first reading after None skips filter
-        first_reading = not self._ema_initialized
-        if first_reading:
+        # EMA smoothing
+        if not self._ema_initialized:
             self.smooth_temp = raw_temp
             self._ema_initialized = True
         else:
             self.smooth_temp = (self.ema_alpha * raw_temp
                                 + (1 - self.ema_alpha) * self.smooth_temp)
 
-        # First reading after None → 100% immediately, let PI ramp down
-        if first_reading:
+        # Warmup: first reading → 100% for WARMUP_DURATION seconds
+        # Accumulates EMA data so PI has stable input when it takes over
+        if self._warmup_until == 0.0 and self.last_speed <= 0:
+            # Transition from off/unknown → first valid temp
+            self._warmup_until = eventtime + WARMUP_DURATION
             self._set_fan(1.0)
             self.last_speed = 1.0
             self.last_time = eventtime
+            logging.info("driver_fan_controller: warmup started, "
+                         "temp %.1fC, fan 100%% for %.0fs",
+                         raw_temp, WARMUP_DURATION)
             return eventtime + self.poll_interval
+
+        if self._warmup_until > 0 and eventtime < self._warmup_until:
+            # Still in warmup — keep 100%, accumulate EMA
+            self.last_time = eventtime
+            return eventtime + self.poll_interval
+
+        # Warmup ended — clear flag
+        warmup_ended = self._warmup_until > 0
+        if warmup_ended:
+            self._warmup_until = 0.0
+            logging.info("driver_fan_controller: warmup ended, "
+                         "temp %.1fC, PI taking over", self.smooth_temp)
 
         # PI controller
         dt = min(eventtime - self.last_time, self.poll_interval * 2)
@@ -142,7 +162,9 @@ class DriverFanController:
             speed = 0.0
 
         # Rate limit — clamp speed change per cycle for smooth ramping
-        if self.max_speed_delta > 0 and self.last_speed >= 0:
+        # Skip when: warmup just ended (first PI calc), fan was off (0→speed)
+        if (self.max_speed_delta > 0 and self.last_speed > 0
+                and not warmup_ended):
             delta = speed - self.last_speed
             if abs(delta) > self.max_speed_delta:
                 speed = self.last_speed + (self.max_speed_delta
