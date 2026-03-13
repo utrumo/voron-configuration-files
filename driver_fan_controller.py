@@ -48,6 +48,7 @@ class DriverFanController:
         self.fan = None
         self.sensors = []
         self.smooth_temp = 0.0
+        self._ema_initialized = False
         self.integral = 0.0
         self.last_speed = -1.0
         self.last_time = 0.0
@@ -89,6 +90,7 @@ class DriverFanController:
         if not temps:
             # All sensors returned None (steppers disabled) — ramp down
             self.smooth_temp = 0.0
+            self._ema_initialized = False
             self.integral = 0.0
             speed = 0.0
             if self.last_speed > 0:
@@ -103,14 +105,15 @@ class DriverFanController:
         raw_temp = max(temps)
 
         # EMA smoothing
-        if self.smooth_temp == 0.0 and raw_temp > 0:
+        if not self._ema_initialized:
             self.smooth_temp = raw_temp
-        elif raw_temp > 0:
+            self._ema_initialized = True
+        else:
             self.smooth_temp = (self.ema_alpha * raw_temp
                                 + (1 - self.ema_alpha) * self.smooth_temp)
 
         # PI controller
-        dt = eventtime - self.last_time
+        dt = min(eventtime - self.last_time, self.poll_interval * 2)
         self.last_time = eventtime
         error = self.smooth_temp - self.target
 
