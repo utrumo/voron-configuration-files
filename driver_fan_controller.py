@@ -4,23 +4,22 @@
 # Uses temperature_combined-like logic but avoids its TMC2240
 # incompatibility (TMC2240 returns temperature=None before homing).
 #
-# Requires [fan_generic <name>] section for pin and UI display.
-# Controls fan via SET_FAN_SPEED gcode (same path as delayed_gcode).
+# Creates own fan.Fan (like controller_fan.py) for direct pin control
+# from reactor timer — fan_generic methods depend on toolhead flush
+# which doesn't happen when idle.
 #
 # Installed as symlink: ~/klipper/klippy/extras/driver_fan_controller.py
 # Source: ~/printer_data/config/driver_fan_controller.py
 #
 # Config example:
-#   [fan_generic driver_fan]
+#   [driver_fan_controller]
 #   pin: PD14
 #   cycle_time: 0.00005
-#
-#   [driver_fan_controller]
-#   fan: driver_fan
 #   sensors: tmc2240 stepper_x, tmc2240 stepper_y
 #   target_temp: 65.0
 
 import logging
+from . import fan
 
 PIN_MIN_TIME = 0.100
 WARMUP_DURATION = 5.0
@@ -30,7 +29,7 @@ class DriverFanController:
         self.printer = config.get_printer()
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
-        self.fan_name = config.get('fan', 'driver_fan')
+        self.fan = fan.Fan(config)
         self.sensor_names = config.getlist('sensors')
         self.target = config.getfloat('target_temp', 65.0)
         self.kp = config.getfloat('kp', 0.2)
@@ -46,7 +45,6 @@ class DriverFanController:
                                              minval=0.1)
         self.integral_max = config.getfloat('integral_max', 10.0)
 
-        self.gcode = None
         self.sensors = []
         self.smooth_temp = 0.0
         self._ema_initialized = False
@@ -56,7 +54,6 @@ class DriverFanController:
         self._warmup_until = 0.0
 
     def handle_ready(self):
-        self.gcode = self.printer.lookup_object('gcode')
         self.sensors = []
         for name in self.sensor_names:
             try:
@@ -75,13 +72,6 @@ class DriverFanController:
         logging.info("driver_fan_controller: started, %d sensors, "
                      "target %.1fC, poll %.1fs",
                      len(self.sensors), self.target, self.poll_interval)
-
-    def _set_fan(self, speed):
-        try:
-            self.gcode.run_script(
-                'SET_FAN_SPEED FAN=%s SPEED=%.4f' % (self.fan_name, speed))
-        except Exception:
-            logging.exception("driver_fan_controller: failed to set fan speed")
 
     def callback(self, eventtime):
         # Read max temperature from all sensors
@@ -106,7 +96,7 @@ class DriverFanController:
                     speed = max(0.0, self.last_speed - self.max_speed_delta)
                 if speed < self.off_below:
                     speed = 0.0
-                self._set_fan(speed)
+                self.fan.set_speed(speed)
                 self.last_speed = speed
             return eventtime + self.poll_interval
 
@@ -122,10 +112,9 @@ class DriverFanController:
                                 + (1 - self.ema_alpha) * self.smooth_temp)
 
         # Warmup: steppers just enabled → 100% for WARMUP_DURATION
-        # Only triggers on None→data transition, not on PI 0→speed
         if first_reading:
             self._warmup_until = eventtime + WARMUP_DURATION
-            self._set_fan(1.0)
+            self.fan.set_speed(1.0)
             self.last_speed = 1.0
             self.last_time = eventtime
             logging.info("driver_fan_controller: warmup started, "
@@ -162,7 +151,7 @@ class DriverFanController:
             speed = 0.0
 
         # Rate limit — clamp speed change per cycle for smooth ramping
-        # Skip when: warmup just ended (first PI calc), fan was off (0→speed)
+        # Skip when: warmup just ended, or fan was off (immediate response)
         if (self.max_speed_delta > 0 and self.last_speed > 0
                 and not warmup_ended):
             delta = speed - self.last_speed
@@ -176,7 +165,7 @@ class DriverFanController:
         if (abs(speed - self.last_speed) > self.hysteresis
                 or (speed == 0 and self.last_speed > 0)
                 or (speed >= 1.0 and self.last_speed < 1.0)):
-            self._set_fan(speed)
+            self.fan.set_speed(speed)
             self.last_speed = speed
 
         return eventtime + self.poll_interval
@@ -186,6 +175,7 @@ class DriverFanController:
             'temperature': self.smooth_temp,
             'target': self.target,
             'speed': max(0.0, self.last_speed),
+            'rpm': None,
             'integral': self.integral,
         }
 
