@@ -112,18 +112,18 @@ class DriverFanController:
 
         raw_temp = max(temps)
 
-        # EMA smoothing
-        if not self._ema_initialized:
+        # EMA smoothing — first_reading = transition from None→data
+        first_reading = not self._ema_initialized
+        if first_reading:
             self.smooth_temp = raw_temp
             self._ema_initialized = True
         else:
             self.smooth_temp = (self.ema_alpha * raw_temp
                                 + (1 - self.ema_alpha) * self.smooth_temp)
 
-        # Warmup: first reading → 100% for WARMUP_DURATION seconds
-        # Accumulates EMA data so PI has stable input when it takes over
-        if self._warmup_until == 0.0 and self.last_speed <= 0:
-            # Transition from off/unknown → first valid temp
+        # Warmup: steppers just enabled → 100% for WARMUP_DURATION
+        # Only triggers on None→data transition, not on PI 0→speed
+        if first_reading:
             self._warmup_until = eventtime + WARMUP_DURATION
             self._set_fan(1.0)
             self.last_speed = 1.0
