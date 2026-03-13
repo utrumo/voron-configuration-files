@@ -9,10 +9,10 @@
 # which doesn't happen when idle.
 #
 # Behavior:
-#   Steppers off (temp=None) → fan off
-#   Steppers on, warming up (temp < warmup_temp) → fan 100%
-#   Steppers on, warmed up (temp >= warmup_temp) → PI controller
-#   Warmup is one-shot per stepper enable cycle
+#   Steppers off → fan off (ramp down)
+#   Steppers on, no temp data yet → fan 100%
+#   Steppers on, temp < warmup_temp → fan 100%
+#   Steppers on, temp >= warmup_temp → PI controller
 #
 # Installed as symlink: ~/klipper/klippy/extras/driver_fan_controller.py
 # Source: ~/printer_data/config/driver_fan_controller.py
@@ -23,7 +23,7 @@
 #   cycle_time: 0.00005
 #   sensors: tmc2240 stepper_x, tmc2240 stepper_y
 #   target_temp: 65.0
-#   warmup_temp: 40.0
+#   warmup_temp: 60.0
 
 import logging
 from . import fan
@@ -54,13 +54,19 @@ class DriverFanController:
                                              minval=0.1)
         self.integral_max = config.getfloat('integral_max', 10.0)
 
+        # Derive stepper names from sensor names (e.g. "tmc2240 stepper_x")
+        self._stepper_names = []
+        for name in self.sensor_names:
+            parts = name.split()
+            if len(parts) == 2:
+                self._stepper_names.append(parts[1])
+
         self.sensors = []
+        self._stepper_enable = None
         self.smooth_temp = 0.0
         self._ema_initialized = False
         self._warming_up = True
         self.integral = 0.0
-        # ramped_speed: rate-limited target (accumulates small steps)
-        # last_speed: actually applied to fan hardware (hysteresis gate)
         self.ramped_speed = 0.0
         self.last_speed = -1.0
         self.last_time = 0.0
@@ -77,6 +83,12 @@ class DriverFanController:
         if not self.sensors:
             logging.error("driver_fan_controller: no sensors available")
             return
+        try:
+            self._stepper_enable = self.printer.lookup_object(
+                'stepper_enable')
+        except Exception:
+            logging.warning("driver_fan_controller: stepper_enable "
+                            "not found")
         reactor = self.printer.get_reactor()
         self.last_time = reactor.monotonic()
         reactor.register_timer(self.callback,
@@ -85,6 +97,19 @@ class DriverFanController:
                      "target %.1fC, warmup %.1fC, poll %.1fs",
                      len(self.sensors), self.target,
                      self.warmup_temp, self.poll_interval)
+
+    def _any_stepper_enabled(self):
+        if self._stepper_enable is None:
+            return False
+        try:
+            status = self._stepper_enable.get_status(None)
+            steppers = status.get('steppers', {})
+            for name in self._stepper_names:
+                if steppers.get(name, False):
+                    return True
+        except Exception:
+            pass
+        return False
 
     def _apply_speed(self, speed):
         """Apply speed to fan with hysteresis gate."""
@@ -106,8 +131,16 @@ class DriverFanController:
                     temps.append(temp)
             except Exception:
                 pass
+
         if not temps:
-            # All sensors returned None (steppers disabled) — ramp down
+            if self._any_stepper_enabled():
+                # Steppers on but no temp data yet — fan 100%
+                if self.last_speed != 1.0:
+                    self.ramped_speed = 1.0
+                    self.fan.set_speed(1.0)
+                    self.last_speed = 1.0
+                return eventtime + self.poll_interval
+            # Steppers off — ramp down
             self.smooth_temp = 0.0
             self._ema_initialized = False
             self._warming_up = True
@@ -167,7 +200,7 @@ class DriverFanController:
             pi_speed = 0.0
 
         # Rate limit — smooth ramping toward PI target
-        # Skip when fan was off → immediate response
+        # Skip when fan was off — immediate response
         if self.max_speed_delta > 0 and self.ramped_speed > 0:
             delta = pi_speed - self.ramped_speed
             if abs(delta) > self.max_speed_delta:
@@ -183,8 +216,6 @@ class DriverFanController:
         if 0 < self.ramped_speed < self.off_below:
             self.ramped_speed = 0.0
 
-        # Apply with hysteresis — accumulated rate-limited changes
-        # pass through when they exceed the threshold
         self._apply_speed(self.ramped_speed)
 
         return eventtime + self.poll_interval
