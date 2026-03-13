@@ -30,6 +30,8 @@ class DriverFanController:
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
         self.fan = fan.Fan(config)
+        self.fan_name = config.get('fan_name', 'driver_fan')
+        self.printer.add_object('fan_generic %s' % self.fan_name, self)
         self.sensor_names = config.getlist('sensors')
         self.target = config.getfloat('target_temp', 65.0)
         self.kp = config.getfloat('kp', 0.2)
