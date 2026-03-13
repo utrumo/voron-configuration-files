@@ -68,6 +68,9 @@ class DriverFanController:
         if not self.sensors:
             logging.error("driver_fan_controller: no sensors available")
             return
+        # Start at 100% — safe default until PI settles
+        self.fan.set_speed(1.0)
+        self.last_speed = 1.0
         reactor = self.printer.get_reactor()
         self.last_time = reactor.monotonic()
         reactor.register_timer(self.callback,
