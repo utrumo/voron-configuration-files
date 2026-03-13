@@ -87,6 +87,17 @@ class DriverFanController:
             except Exception:
                 pass
         if not temps:
+            # All sensors returned None (steppers disabled) — ramp down
+            self.smooth_temp = 0.0
+            self.integral = 0.0
+            speed = 0.0
+            if self.last_speed > 0:
+                if self.max_speed_delta > 0:
+                    speed = max(0.0, self.last_speed - self.max_speed_delta)
+                if speed < self.off_below:
+                    speed = 0.0
+                self.fan.set_speed(speed)
+                self.last_speed = speed
             return eventtime + self.poll_interval
 
         raw_temp = max(temps)
