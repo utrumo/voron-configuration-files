@@ -59,6 +59,9 @@ class DriverFanController:
         self._ema_initialized = False
         self._warming_up = True
         self.integral = 0.0
+        # ramped_speed: rate-limited target (accumulates small steps)
+        # last_speed: actually applied to fan hardware (hysteresis gate)
+        self.ramped_speed = 0.0
         self.last_speed = -1.0
         self.last_time = 0.0
 
@@ -83,6 +86,15 @@ class DriverFanController:
                      len(self.sensors), self.target,
                      self.warmup_temp, self.poll_interval)
 
+    def _apply_speed(self, speed):
+        """Apply speed to fan with hysteresis gate."""
+        if (abs(speed - self.last_speed) > self.hysteresis
+                or (speed == 0 and self.last_speed > 0)
+                or (speed >= 1.0 and self.last_speed < 1.0)
+                or self.last_speed < 0):
+            self.fan.set_speed(speed)
+            self.last_speed = speed
+
     def callback(self, eventtime):
         # Read max temperature from all sensors
         temps = []
@@ -100,14 +112,15 @@ class DriverFanController:
             self._ema_initialized = False
             self._warming_up = True
             self.integral = 0.0
-            speed = 0.0
             if self.last_speed > 0:
                 if self.max_speed_delta > 0:
-                    speed = max(0.0, self.last_speed - self.max_speed_delta)
-                if speed < self.off_below:
-                    speed = 0.0
-                self.fan.set_speed(speed)
-                self.last_speed = speed
+                    self.ramped_speed = max(
+                        0.0, self.ramped_speed - self.max_speed_delta)
+                else:
+                    self.ramped_speed = 0.0
+                if self.ramped_speed < self.off_below:
+                    self.ramped_speed = 0.0
+                self._apply_speed(self.ramped_speed)
             return eventtime + self.poll_interval
 
         raw_temp = max(temps)
@@ -125,15 +138,14 @@ class DriverFanController:
             if self.smooth_temp >= self.warmup_temp:
                 self._warming_up = False
                 self.last_time = eventtime
-                # Pre-seed integral so PI continues near current speed
-                # Without this, PI output = 0 at target temp → fan drops
                 self.integral = self.integral_max
+                self.ramped_speed = 1.0
                 logging.info("driver_fan_controller: warmup done at %.1fC, "
                              "PI taking over (integral pre-seeded to %.1f)",
                              self.smooth_temp, self.integral)
             else:
-                speed = 1.0
                 if self.last_speed != 1.0:
+                    self.ramped_speed = 1.0
                     self.fan.set_speed(1.0)
                     self.last_speed = 1.0
                 return eventtime + self.poll_interval
@@ -149,28 +161,31 @@ class DriverFanController:
                             min(self.integral_max, self.integral))
         i_term = self.ki * self.integral / 100.0
 
-        speed = max(0.0, min(1.0, p_term + i_term))
+        pi_speed = max(0.0, min(1.0, p_term + i_term))
 
-        if 0 < speed < self.off_below:
-            speed = 0.0
+        if 0 < pi_speed < self.off_below:
+            pi_speed = 0.0
 
-        # Rate limit — smooth ramping in steady state
+        # Rate limit — smooth ramping toward PI target
         # Skip when fan was off → immediate response
-        if self.max_speed_delta > 0 and self.last_speed > 0:
-            delta = speed - self.last_speed
+        if self.max_speed_delta > 0 and self.ramped_speed > 0:
+            delta = pi_speed - self.ramped_speed
             if abs(delta) > self.max_speed_delta:
-                speed = self.last_speed + (self.max_speed_delta
-                                           if delta > 0
-                                           else -self.max_speed_delta)
-                speed = max(0.0, min(1.0, speed))
+                self.ramped_speed += (self.max_speed_delta
+                                      if delta > 0
+                                      else -self.max_speed_delta)
+                self.ramped_speed = max(0.0, min(1.0, self.ramped_speed))
+            else:
+                self.ramped_speed = pi_speed
+        else:
+            self.ramped_speed = pi_speed
 
-        # Apply hysteresis — only change if difference is significant
-        if (abs(speed - self.last_speed) > self.hysteresis
-                or (speed == 0 and self.last_speed > 0)
-                or (speed >= 1.0 and self.last_speed < 1.0)
-                or self.last_speed < 0):
-            self.fan.set_speed(speed)
-            self.last_speed = speed
+        if 0 < self.ramped_speed < self.off_below:
+            self.ramped_speed = 0.0
+
+        # Apply with hysteresis — accumulated rate-limited changes
+        # pass through when they exceed the threshold
+        self._apply_speed(self.ramped_speed)
 
         return eventtime + self.poll_interval
 
