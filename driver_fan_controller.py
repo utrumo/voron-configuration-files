@@ -10,8 +10,9 @@
 #
 # Behavior:
 #   Steppers off (temp=None) → fan off
-#   Steppers on, temp < target → fan at idle_speed
-#   Steppers on, temp >= target → PI controller (idle_speed..1.0)
+#   Steppers on, warming up (temp < warmup_temp) → fan 100%
+#   Steppers on, warmed up (temp >= warmup_temp) → PI controller
+#   Warmup is one-shot per stepper enable cycle
 #
 # Installed as symlink: ~/klipper/klippy/extras/driver_fan_controller.py
 # Source: ~/printer_data/config/driver_fan_controller.py
@@ -22,7 +23,7 @@
 #   cycle_time: 0.00005
 #   sensors: tmc2240 stepper_x, tmc2240 stepper_y
 #   target_temp: 65.0
-#   idle_speed: 0.3
+#   warmup_temp: 40.0
 
 import logging
 from . import fan
@@ -39,11 +40,12 @@ class DriverFanController:
         self.printer.add_object('fan_generic %s' % self.fan_name, self)
         self.sensor_names = config.getlist('sensors')
         self.target = config.getfloat('target_temp', 65.0)
-        self.idle_speed = config.getfloat('idle_speed', 0.3,
-                                          minval=0., maxval=1.)
+        self.warmup_temp = config.getfloat('warmup_temp', 40.0)
         self.kp = config.getfloat('kp', 0.2)
         self.ki = config.getfloat('ki', 2.0)
         self.ema_alpha = config.getfloat('ema_alpha', 0.3,
+                                         minval=0., maxval=1.)
+        self.off_below = config.getfloat('off_below', 0.15,
                                          minval=0., maxval=1.)
         self.hysteresis = config.getfloat('hysteresis', 0.05, minval=0.)
         self.max_speed_delta = config.getfloat('max_speed_delta', 0.,
@@ -55,6 +57,7 @@ class DriverFanController:
         self.sensors = []
         self.smooth_temp = 0.0
         self._ema_initialized = False
+        self._warming_up = True
         self.integral = 0.0
         self.last_speed = -1.0
         self.last_time = 0.0
@@ -76,9 +79,9 @@ class DriverFanController:
         reactor.register_timer(self.callback,
                                reactor.monotonic() + PIN_MIN_TIME)
         logging.info("driver_fan_controller: started, %d sensors, "
-                     "target %.1fC, idle %.0f%%, poll %.1fs",
+                     "target %.1fC, warmup %.1fC, poll %.1fs",
                      len(self.sensors), self.target,
-                     self.idle_speed * 100, self.poll_interval)
+                     self.warmup_temp, self.poll_interval)
 
     def callback(self, eventtime):
         # Read max temperature from all sensors
@@ -95,12 +98,13 @@ class DriverFanController:
             # All sensors returned None (steppers disabled) — ramp down
             self.smooth_temp = 0.0
             self._ema_initialized = False
+            self._warming_up = True
             self.integral = 0.0
             speed = 0.0
             if self.last_speed > 0:
                 if self.max_speed_delta > 0:
                     speed = max(0.0, self.last_speed - self.max_speed_delta)
-                if speed < self.idle_speed:
+                if speed < self.off_below:
                     speed = 0.0
                 self.fan.set_speed(speed)
                 self.last_speed = speed
@@ -116,37 +120,51 @@ class DriverFanController:
             self.smooth_temp = (self.ema_alpha * raw_temp
                                 + (1 - self.ema_alpha) * self.smooth_temp)
 
-        # Below target → 100% until drivers reach operating temp
-        if self.smooth_temp < self.target:
-            speed = 1.0
-        else:
-            # PI controller — active above target
-            dt = min(eventtime - self.last_time, self.poll_interval * 2)
-            self.last_time = eventtime
-            error = self.smooth_temp - self.target
+        # Warmup phase: 100% until temp reaches warmup_temp (one-shot)
+        if self._warming_up:
+            if self.smooth_temp >= self.warmup_temp:
+                self._warming_up = False
+                self.last_time = eventtime
+                logging.info("driver_fan_controller: warmup done at %.1fC, "
+                             "PI taking over", self.smooth_temp)
+            else:
+                speed = 1.0
+                if self.last_speed != 1.0:
+                    self.fan.set_speed(1.0)
+                    self.last_speed = 1.0
+                return eventtime + self.poll_interval
 
-            p_term = self.kp * error
-            self.integral += error * dt
-            self.integral = max(-self.integral_max,
-                                min(self.integral_max, self.integral))
-            i_term = self.ki * self.integral / 100.0
+        # PI controller
+        dt = min(eventtime - self.last_time, self.poll_interval * 2)
+        self.last_time = eventtime
+        error = self.smooth_temp - self.target
 
-            speed = max(self.idle_speed, min(1.0, p_term + i_term))
+        p_term = self.kp * error
+        self.integral += error * dt
+        self.integral = max(-self.integral_max,
+                            min(self.integral_max, self.integral))
+        i_term = self.ki * self.integral / 100.0
+
+        speed = max(0.0, min(1.0, p_term + i_term))
+
+        if 0 < speed < self.off_below:
+            speed = 0.0
 
         # Rate limit — smooth ramping in steady state
-        # Skip when fan was off → immediate jump to idle_speed or higher
+        # Skip when fan was off → immediate response
         if self.max_speed_delta > 0 and self.last_speed > 0:
             delta = speed - self.last_speed
             if abs(delta) > self.max_speed_delta:
                 speed = self.last_speed + (self.max_speed_delta
                                            if delta > 0
                                            else -self.max_speed_delta)
-                speed = max(self.idle_speed, min(1.0, speed))
+                speed = max(0.0, min(1.0, speed))
 
         # Apply hysteresis — only change if difference is significant
         if (abs(speed - self.last_speed) > self.hysteresis
+                or (speed == 0 and self.last_speed > 0)
                 or (speed >= 1.0 and self.last_speed < 1.0)
-                or self.last_speed <= 0):
+                or self.last_speed < 0):
             self.fan.set_speed(speed)
             self.last_speed = speed
 
