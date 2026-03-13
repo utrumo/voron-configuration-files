@@ -17,6 +17,7 @@
 #   ema_alpha: 0.3
 #   off_below: 0.15
 #   hysteresis: 0.05
+#   max_speed_delta: 0.01
 #   poll_interval: 0.3
 
 import logging
@@ -38,6 +39,8 @@ class DriverFanController:
         self.off_below = config.getfloat('off_below', 0.15,
                                          minval=0., maxval=1.)
         self.hysteresis = config.getfloat('hysteresis', 0.05, minval=0.)
+        self.max_speed_delta = config.getfloat('max_speed_delta', 0.,
+                                               minval=0., maxval=1.)
         self.poll_interval = config.getfloat('poll_interval', 0.3,
                                              minval=0.1)
         self.integral_max = config.getfloat('integral_max', 10.0)
@@ -110,6 +113,15 @@ class DriverFanController:
 
         if 0 < speed < self.off_below:
             speed = 0.0
+
+        # Rate limit — clamp speed change per cycle for smooth ramping
+        if self.max_speed_delta > 0 and self.last_speed >= 0:
+            delta = speed - self.last_speed
+            if abs(delta) > self.max_speed_delta:
+                speed = self.last_speed + (self.max_speed_delta
+                                           if delta > 0
+                                           else -self.max_speed_delta)
+                speed = max(0.0, min(1.0, speed))
 
         # Apply hysteresis — only change if difference is significant
         if (abs(speed - self.last_speed) > self.hysteresis
