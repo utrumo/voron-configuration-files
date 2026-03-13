@@ -68,9 +68,6 @@ class DriverFanController:
         if not self.sensors:
             logging.error("driver_fan_controller: no sensors available")
             return
-        # Start at 100% — safe default until PI settles
-        self.fan.set_speed(1.0)
-        self.last_speed = 1.0
         reactor = self.printer.get_reactor()
         self.last_time = reactor.monotonic()
         reactor.register_timer(self.callback,
@@ -107,8 +104,9 @@ class DriverFanController:
 
         raw_temp = max(temps)
 
-        # EMA smoothing
-        if not self._ema_initialized:
+        # EMA smoothing — first reading after None skips filter
+        first_reading = not self._ema_initialized
+        if first_reading:
             self.smooth_temp = raw_temp
             self._ema_initialized = True
         else:
@@ -132,7 +130,8 @@ class DriverFanController:
             speed = 0.0
 
         # Rate limit — clamp speed change per cycle for smooth ramping
-        if self.max_speed_delta > 0 and self.last_speed >= 0:
+        # Skip on first reading after None → immediate fan response
+        if self.max_speed_delta > 0 and self.last_speed >= 0 and not first_reading:
             delta = speed - self.last_speed
             if abs(delta) > self.max_speed_delta:
                 speed = self.last_speed + (self.max_speed_delta
