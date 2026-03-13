@@ -98,7 +98,7 @@ class DriverFanController:
                     speed = max(0.0, self.last_speed - self.max_speed_delta)
                 if speed < self.off_below:
                     speed = 0.0
-                self.fan.set_speed(speed)
+                self.fan.set_speed_from_command(speed)
                 self.last_speed = speed
             return eventtime + self.poll_interval
 
@@ -143,7 +143,7 @@ class DriverFanController:
         if (abs(speed - self.last_speed) > self.hysteresis
                 or (speed == 0 and self.last_speed > 0)
                 or (speed >= 1.0 and self.last_speed < 1.0)):
-            self.fan.set_speed(speed)
+            self.fan.set_speed_from_command(speed)
             self.last_speed = speed
 
         return eventtime + self.poll_interval
