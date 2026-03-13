@@ -116,21 +116,22 @@ class DriverFanController:
             self.smooth_temp = (self.ema_alpha * raw_temp
                                 + (1 - self.ema_alpha) * self.smooth_temp)
 
-        # PI controller
-        dt = min(eventtime - self.last_time, self.poll_interval * 2)
-        self.last_time = eventtime
-        error = self.smooth_temp - self.target
+        # Below target → 100% until drivers reach operating temp
+        if self.smooth_temp < self.target:
+            speed = 1.0
+        else:
+            # PI controller — active above target
+            dt = min(eventtime - self.last_time, self.poll_interval * 2)
+            self.last_time = eventtime
+            error = self.smooth_temp - self.target
 
-        p_term = self.kp * error
-        self.integral += error * dt
-        self.integral = max(-self.integral_max,
-                            min(self.integral_max, self.integral))
-        i_term = self.ki * self.integral / 100.0
+            p_term = self.kp * error
+            self.integral += error * dt
+            self.integral = max(-self.integral_max,
+                                min(self.integral_max, self.integral))
+            i_term = self.ki * self.integral / 100.0
 
-        speed = max(0.0, min(1.0, p_term + i_term))
-
-        # Floor at idle_speed — drivers are on, always provide some cooling
-        speed = max(self.idle_speed, speed)
+            speed = max(self.idle_speed, min(1.0, p_term + i_term))
 
         # Rate limit — smooth ramping in steady state
         # Skip when fan was off → immediate jump to idle_speed or higher
