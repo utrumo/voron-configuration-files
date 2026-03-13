@@ -125,8 +125,12 @@ class DriverFanController:
             if self.smooth_temp >= self.warmup_temp:
                 self._warming_up = False
                 self.last_time = eventtime
+                # Pre-seed integral so PI continues near current speed
+                # Without this, PI output = 0 at target temp → fan drops
+                self.integral = self.integral_max
                 logging.info("driver_fan_controller: warmup done at %.1fC, "
-                             "PI taking over", self.smooth_temp)
+                             "PI taking over (integral pre-seeded to %.1f)",
+                             self.smooth_temp, self.integral)
             else:
                 speed = 1.0
                 if self.last_speed != 1.0:
