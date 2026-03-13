@@ -4,12 +4,15 @@
 # Uses temperature_combined-like logic but avoids its TMC2240
 # incompatibility (TMC2240 returns temperature=None before homing).
 #
+# Creates its own fan.Fan (like controller_fan.py) for direct pin
+# control from reactor timer — fan_generic depends on toolhead flush.
+#
 # Installed as symlink: ~/klipper/klippy/extras/driver_fan_controller.py
 # Source: ~/printer_data/config/driver_fan_controller.py
 #
 # Config example:
 #   [driver_fan_controller]
-#   fan: driver_fan
+#   pin: PD14
 #   sensors: tmc2240 stepper_x, tmc2240 stepper_y
 #   target_temp: 65.0
 #   kp: 0.2
@@ -21,6 +24,7 @@
 #   poll_interval: 0.3
 
 import logging
+from . import fan
 
 PIN_MIN_TIME = 0.100
 
@@ -29,7 +33,7 @@ class DriverFanController:
         self.printer = config.get_printer()
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
-        self.fan_name = config.get('fan', 'driver_fan')
+        self.fan = fan.Fan(config)
         self.sensor_names = config.getlist('sensors')
         self.target = config.getfloat('target_temp', 65.0)
         self.kp = config.getfloat('kp', 0.2)
@@ -45,7 +49,6 @@ class DriverFanController:
                                              minval=0.1)
         self.integral_max = config.getfloat('integral_max', 10.0)
 
-        self.fan = None
         self.sensors = []
         self.smooth_temp = 0.0
         self._ema_initialized = False
@@ -54,9 +57,6 @@ class DriverFanController:
         self.last_time = 0.0
 
     def handle_ready(self):
-        fan_obj = self.printer.lookup_object(
-            'fan_generic %s' % self.fan_name)
-        self.fan = fan_obj.fan
         self.sensors = []
         for name in self.sensor_names:
             try:
@@ -98,7 +98,7 @@ class DriverFanController:
                     speed = max(0.0, self.last_speed - self.max_speed_delta)
                 if speed < self.off_below:
                     speed = 0.0
-                self.fan.set_speed_from_command(speed)
+                self.fan.set_speed(speed)
                 self.last_speed = speed
             return eventtime + self.poll_interval
 
@@ -143,7 +143,7 @@ class DriverFanController:
         if (abs(speed - self.last_speed) > self.hysteresis
                 or (speed == 0 and self.last_speed > 0)
                 or (speed >= 1.0 and self.last_speed < 1.0)):
-            self.fan.set_speed_from_command(speed)
+            self.fan.set_speed(speed)
             self.last_speed = speed
 
         return eventtime + self.poll_interval
